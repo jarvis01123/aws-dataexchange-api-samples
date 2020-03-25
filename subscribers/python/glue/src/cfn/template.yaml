@@ -1,0 +1,317 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: "AWS Data Exchange automated revision download upon publish Cloudwatch event"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "AWS Data Exchange - Revision Automation"
+        Parameters:
+          - DatasetID
+          - RevisionID
+          - IncludePrefix
+    ParameterLabels:
+      DatasetID:
+        default: "Which Data set?"
+      RevisionID:
+        default: "Which Revision to download immediately?"
+
+Parameters:
+  # Replace with data set ID that is in a Product subscribed to
+  DatasetID:
+    Type: String
+    Description: "REQUIRED: the ID for the data set. The default is the Amazon Heartbeat test product, revisions every 10 minutes."
+    Default: "ec7d4c68bef299bcd70815e6e91f4caf"
+
+  RevisionID:
+    Type: String
+    Description: "OPTIONAL: ID for a Revision to download immediately. The dafault is an Amazon Heartbeat test product revision dated 2019/10/30"
+    Default: "9ecc2e15dd21ba5d10fc8ffde42050c3"
+
+Resources:
+  DataS3Bucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties: {}
+
+  # Lambda Layer for dataexchangesdk
+  dataexchangesdk:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: "arn:aws:serverlessrepo:us-east-1:697637923817:applications/dataexchangesdk"
+        SemanticVersion: 0.0.3
+
+  # Lambda functions
+  FunctionGetNewRevision:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Layers:
+        - !GetAtt dataexchangesdk.Outputs.LayerArn
+      Code:
+        ZipFile: |
+          import os
+
+          os.environ['AWS_DATA_PATH'] = '/opt/'
+
+          from itertools import islice
+          import boto3
+          import time
+          import json
+          import cfnresponse
+
+          region = os.environ['AWS_REGION']
+          destination_bucket = os.environ['S3_BUCKET']
+
+          # Grouper recipe from standard docs: https://docs.python.org/3/library/itertools.html
+          def grouper(iterable, n):
+              iterator = iter(iterable)
+              group = tuple(islice(iterator, n))
+              while group:
+                  yield group
+                  group = tuple(islice(iterator, n))
+
+
+          def handler(event, context):
+              # Let AWS Cloudformation know its request succeeded
+              if 'RequestType' in event:
+                  responseData = {}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+
+              dataexchange = boto3.client(
+                  service_name='dataexchange',
+                  region_name=region
+              )
+              s3 = boto3.client(
+                  service_name='s3',
+                  region_name=region
+              )
+
+              glue = boto3.client(
+                  service_name='glue',
+                  region_name=region
+              )
+
+              # If the request is from Cloudformation custom resource get the RevisionID, for first revision
+              if 'ResourceProperties' in event:
+                  data_set_id = event['ResourceProperties']['data_set_id']
+                  revision_ids = [event['ResourceProperties']['revision_id']]
+                  print("Initial revision retrieval", data_set_id, revision_ids)
+                  print(event)
+              else:
+                  data_set_id = event['resources'][0]
+                  revision_ids = event['detail']['RevisionIds']
+                  print("Triggered revision retrieval")
+                  print(event)
+              # Used to store the Ids of the Jobs exporting the assets to S3.
+              job_ids = set()
+
+              for revision_id in revision_ids:
+                  revision_assets = dataexchange.list_revision_assets(DataSetId=data_set_id, RevisionId=revision_id)
+                  assets_chunks = grouper(revision_assets.get('Assets'), 100)
+
+                  for assets_chunk in assets_chunks:
+                      asset_destinations = []
+                      for asset in assets_chunk:
+                          asset_destinations.append({
+                              'AssetId': asset['Id'],
+                              'Bucket': destination_bucket
+                          })
+
+                          export_job = dataexchange.create_job(
+                              Type='EXPORT_ASSETS_TO_S3',
+                              Details={
+                                  'ExportAssetsToS3': {
+                                      'DataSetId': data_set_id,
+                                      'RevisionId': revision_id,
+                                      'AssetDestinations': asset_destinations
+                                  }
+                              }
+                          )
+                          dataexchange.start_job(JobId=export_job['Id'])
+                          job_ids.add(export_job['Id'])
+
+              # Iterate until all remaining workflow have reached a terminal state, or an error is found.
+              completed_jobs = set()
+              while job_ids != completed_jobs:
+                  for job_id in job_ids:
+                      if job_id in completed_jobs:
+                          continue
+                      get_job_response = dataexchange.get_job(JobId=job_id)
+                      if get_job_response['State'] == 'COMPLETED':
+                          print("Job {} completed".format(job_id))
+                          completed_jobs.add(job_id)
+                      # Sleep to ensure we don't get throttled by the GetJob API.
+                      time.sleep(0.2)
+
+              glue.start_crawler(Name=f"{data_set_id}-adx-crawler")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('All jobs completed.')
+              }
+      Handler: "index.handler"
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataS3Bucket
+          GLUE_ROLE: !Ref GlueRole
+      Role: !GetAtt "RoleGetNewRevision.Arn"
+      Runtime: "python3.7"
+      Timeout: 180
+
+  #Invoke Lambda to get First Revision
+  FirstRevision:
+    Type: "Custom::FirstInvoke"
+    DependsOn: [DataS3Bucket]
+    DeletionPolicy: Retain
+    Properties:
+      ServiceToken: !GetAtt "FunctionGetNewRevision.Arn"
+      data_set_id: !Ref "DatasetID"
+      revision_id: !Ref "RevisionID"
+
+  #IAM Roles for Lambda
+  RoleGetNewRevision:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Policies:
+        - PolicyName: DataExchange
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dataexchange:StartJob"
+                  - "dataexchange:CreateJob"
+                  - "dataexchange:GetJob"
+                  - "dataexchange:ListRevisionAssets"
+                Resource: "*"
+        - PolicyName: RevisionS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Join ["", [!GetAtt DataS3Bucket.Arn, "/"]]
+                  - !Join ["", [!GetAtt DataS3Bucket.Arn, "/*"]]
+        - PolicyName: dataexchangeS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - "arn:aws:s3:::*aws-data-exchange*"
+        - PolicyName: GlueCrawlers
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "glue:StartCrawler"
+                  - "glue:CreateCrawler"
+                  - "iam:PassRole"
+                Resource: 
+                  - '*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  #Cloudwatch Event Rule S3 Dataset bucket put object to Trigger Revision Lambda
+  NewRevisionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "New Revision Event"
+      EventPattern:
+        source:
+          - "aws.dataexchange"
+        detail-type:
+          - "Revision Published To Data Set"
+        resources:
+          - !Ref DatasetID
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt
+            - FunctionGetNewRevision
+            - Arn
+          Id: "TargetGetNewRevision"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt
+        - FunctionGetNewRevision
+        - Arn
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt
+        - NewRevisionEventRule
+        - Arn
+
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "*"
+                Resource: "*"
+ 
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${DatasetID}-adx-database
+        Description: "TestDatabaseDescription"
+        LocationUri: "TestLocationUri"
+ 
+  GlueCrawler:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Role: !Ref GlueRole
+      Description: Crawler for Data Exchange
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        - !Ref DataS3Bucket
+      Name: !Sub ${DatasetID}-adx-database
+  
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: [GlueDatabase, DataS3Bucket]
+    Properties:
+      Name: !Sub ${DatasetID}-adx-crawler
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Ref DataS3Bucket
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
